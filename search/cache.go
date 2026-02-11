@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/yoavf/ai-sessions-mcp/adapters"
+	_ "modernc.org/sqlite"
 )
 
 //go:embed schema.sql
@@ -29,9 +29,20 @@ func NewCache(dbPath string) (*Cache, error) {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Enable WAL mode for better concurrent read performance
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+	}
+	// Avoid immediate SQLITE_BUSY errors under contention
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set busy timeout: %w", err)
 	}
 
 	// Initialize schema
