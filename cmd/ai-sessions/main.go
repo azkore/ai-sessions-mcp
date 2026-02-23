@@ -380,6 +380,12 @@ func addGetSessionTool(server *mcp.Server, adaptersMap map[string]adapters.Sessi
 			}
 		}
 
+		for i := range messages {
+			if messages[i].PartTypes == nil {
+				messages[i].PartTypes = map[string]int{}
+			}
+		}
+
 		totalPages := 0
 		if totalMessages > 0 {
 			totalPages = (totalMessages + args.PageSize - 1) / args.PageSize

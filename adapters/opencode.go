@@ -101,6 +101,12 @@ type opencodeMessage struct {
 	SessionID string                 `json:"sessionID,omitempty"`
 }
 
+type opencodePartSummary struct {
+	TextParts    []string
+	PartTypes    map[string]int
+	NonTextParts []map[string]interface{}
+}
+
 // ListSessions returns all opencode sessions for the given project.
 // If projectPath is empty, returns sessions from ALL projects.
 func (o *OpencodeAdapter) ListSessions(projectPath string, limit int) ([]Session, error) {
@@ -441,27 +447,67 @@ func (o *OpencodeAdapter) getFirstUserMessageAndCount(storageDir, sessionID stri
 	return firstMessage, userCount, nil
 }
 
-// extractMessageContent converts message content to string
+// extractMessageContent converts message content to string.
 func (o *OpencodeAdapter) extractMessageContent(content interface{}) string {
+	summary := o.summarizeMessageContent(content)
+	return strings.Join(summary.TextParts, "\n")
+}
+
+func (o *OpencodeAdapter) summarizeMessageContent(content interface{}) opencodePartSummary {
+	summary := opencodePartSummary{
+		TextParts:    make([]string, 0),
+		PartTypes:    make(map[string]int),
+		NonTextParts: make([]map[string]interface{}, 0),
+	}
+
 	switch v := content.(type) {
 	case string:
-		return v
+		if strings.TrimSpace(v) != "" {
+			summary.TextParts = append(summary.TextParts, v)
+			summary.PartTypes["text"]++
+		}
 	case []interface{}:
-		var parts []string
 		for _, item := range v {
-			if m, ok := item.(map[string]interface{}); ok {
-				if text, ok := m["text"].(string); ok {
-					parts = append(parts, text)
-				}
+			if part, ok := item.(map[string]interface{}); ok {
+				o.addPartToSummary(&summary, part)
 			}
 		}
-		return strings.Join(parts, "\n")
 	case map[string]interface{}:
-		if text, ok := v["text"].(string); ok {
-			return text
-		}
+		o.addPartToSummary(&summary, v)
 	}
-	return ""
+
+	return summary
+}
+
+func (o *OpencodeAdapter) addPartToSummary(summary *opencodePartSummary, part map[string]interface{}) {
+	partType := o.getPartType(part)
+	summary.PartTypes[partType]++
+
+	if partType == "text" {
+		if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
+			summary.TextParts = append(summary.TextParts, text)
+		}
+		return
+	}
+
+	copyPart := make(map[string]interface{}, len(part))
+	for k, v := range part {
+		copyPart[k] = v
+	}
+	summary.NonTextParts = append(summary.NonTextParts, copyPart)
+}
+
+func (o *OpencodeAdapter) getPartType(part map[string]interface{}) string {
+	if part == nil {
+		return "unknown"
+	}
+	if partType, ok := part["type"].(string); ok && strings.TrimSpace(partType) != "" {
+		return partType
+	}
+	if _, ok := part["text"]; ok {
+		return "text"
+	}
+	return "unknown"
 }
 
 // extractFirstLine extracts the first non-empty line from text
@@ -575,7 +621,7 @@ func (o *OpencodeAdapter) getSessionPageFromSQLite(sessionID string, page, pageS
 		return nil, 0, page, false, fmt.Errorf("failed while iterating sqlite message page: %w", err)
 	}
 
-	textPartsByMessageID, err := o.getMessageTextPartsByMessageID(db, messageIDs)
+	partsByMessageID, err := o.getMessagePartsByMessageID(db, messageIDs)
 	if err != nil {
 		return nil, 0, page, false, err
 	}
@@ -587,15 +633,35 @@ func (o *OpencodeAdapter) getSessionPageFromSQLite(sessionID string, page, pageS
 			return nil, 0, page, false, fmt.Errorf("failed to parse sqlite message JSON: %w", err)
 		}
 
-		content := strings.Join(textPartsByMessageID[row.id], "\n")
+		partSummary, ok := partsByMessageID[row.id]
+		if !ok {
+			partSummary = opencodePartSummary{PartTypes: map[string]int{}}
+		}
+
+		content := strings.Join(partSummary.TextParts, "\n")
 		if content == "" {
-			content = o.extractMessageContent(msg.Content)
+			fallbackSummary := o.summarizeMessageContent(msg.Content)
+			if len(partSummary.NonTextParts) == 0 && len(fallbackSummary.NonTextParts) > 0 {
+				partSummary.NonTextParts = fallbackSummary.NonTextParts
+			}
+			if len(partSummary.PartTypes) == 0 && len(fallbackSummary.PartTypes) > 0 {
+				partSummary.PartTypes = fallbackSummary.PartTypes
+			}
+			content = strings.Join(fallbackSummary.TextParts, "\n")
+		}
+		if partSummary.PartTypes == nil {
+			partSummary.PartTypes = map[string]int{}
 		}
 
 		message := Message{
-			Role:     msg.Role,
-			Content:  content,
-			Metadata: make(map[string]interface{}),
+			Role:            msg.Role,
+			Content:         content,
+			Metadata:        make(map[string]interface{}),
+			HasNonTextParts: len(partSummary.NonTextParts) > 0,
+			PartTypes:       partSummary.PartTypes,
+		}
+		if len(partSummary.NonTextParts) > 0 {
+			message.NonTextParts = partSummary.NonTextParts
 		}
 
 		message.Timestamp = time.UnixMilli(row.createdAt)
@@ -649,8 +715,8 @@ func (o *OpencodeAdapter) countSessionMessagesFromSQLite(db *sql.DB, sessionID s
 	return total, nil
 }
 
-func (o *OpencodeAdapter) getMessageTextPartsByMessageID(db *sql.DB, messageIDs []string) (map[string][]string, error) {
-	result := make(map[string][]string, len(messageIDs))
+func (o *OpencodeAdapter) getMessagePartsByMessageID(db *sql.DB, messageIDs []string) (map[string]opencodePartSummary, error) {
+	result := make(map[string]opencodePartSummary, len(messageIDs))
 	if len(messageIDs) == 0 {
 		return result, nil
 	}
@@ -667,10 +733,9 @@ func (o *OpencodeAdapter) getMessageTextPartsByMessageID(db *sql.DB, messageIDs 
 		placeholders = strings.TrimSuffix(placeholders, ",")
 
 		query := fmt.Sprintf(`
-			SELECT message_id, COALESCE(json_extract(data, '$.text'), '')
+			SELECT message_id, data
 			FROM part
 			WHERE message_id IN (%s)
-			  AND json_extract(data, '$.type') = 'text'
 			ORDER BY message_id ASC, time_created ASC
 		`, placeholders)
 
@@ -686,14 +751,34 @@ func (o *OpencodeAdapter) getMessageTextPartsByMessageID(db *sql.DB, messageIDs 
 
 		for rows.Next() {
 			var messageID string
-			var text sql.NullString
-			if err := rows.Scan(&messageID, &text); err != nil {
+			var rawPart string
+			if err := rows.Scan(&messageID, &rawPart); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("failed to scan sqlite part text: %w", err)
+				return nil, fmt.Errorf("failed to scan sqlite part row: %w", err)
 			}
 
-			if text.Valid && strings.TrimSpace(text.String) != "" {
-				result[messageID] = append(result[messageID], text.String)
+			var part map[string]interface{}
+			if err := json.Unmarshal([]byte(rawPart), &part); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to parse sqlite part JSON: %w", err)
+			}
+
+			summary, ok := result[messageID]
+			if !ok {
+				summary = opencodePartSummary{
+					TextParts:    make([]string, 0),
+					PartTypes:    make(map[string]int),
+					NonTextParts: make([]map[string]interface{}, 0),
+				}
+			}
+
+			o.addPartToSummary(&summary, part)
+			result[messageID] = summary
+		}
+
+		for _, id := range chunk {
+			if _, ok := result[id]; !ok {
+				result[id] = opencodePartSummary{PartTypes: map[string]int{}}
 			}
 		}
 
@@ -804,10 +889,20 @@ func (o *OpencodeAdapter) readAllMessages(messageDir string) ([]Message, error) 
 			continue
 		}
 
+		summary := o.summarizeMessageContent(msg.Content)
+
 		message := Message{
-			Role:     msg.Role,
-			Content:  o.extractMessageContent(msg.Content),
-			Metadata: make(map[string]interface{}),
+			Role:            msg.Role,
+			Content:         strings.Join(summary.TextParts, "\n"),
+			Metadata:        make(map[string]interface{}),
+			HasNonTextParts: len(summary.NonTextParts) > 0,
+			PartTypes:       summary.PartTypes,
+		}
+		if message.PartTypes == nil {
+			message.PartTypes = map[string]int{}
+		}
+		if len(summary.NonTextParts) > 0 {
+			message.NonTextParts = summary.NonTextParts
 		}
 
 		// Parse timestamp from time.created

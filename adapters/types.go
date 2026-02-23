@@ -49,6 +49,16 @@ type Message struct {
 
 	// Metadata contains agent-specific additional data (e.g., tool calls, thinking blocks)
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+
+	// HasNonTextParts indicates whether this message includes non-text structured parts
+	// (for example, tool invocations/results or reasoning blocks).
+	HasNonTextParts bool `json:"has_non_text_parts"`
+
+	// PartTypes counts message parts by type (e.g. "text": 1, "tool-result": 2).
+	PartTypes map[string]int `json:"part_types"`
+
+	// NonTextParts contains structured non-text parts when available for the source.
+	NonTextParts []map[string]interface{} `json:"non_text_parts,omitempty"`
 }
 
 // extractFirstLine extracts the first non-empty line from text, truncating if needed.

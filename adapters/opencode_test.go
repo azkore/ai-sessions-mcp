@@ -113,6 +113,7 @@ func TestOpencodeAdapterSQLiteSessions(t *testing.T) {
 		VALUES
 			('part_user', 'msg_user', 'ses_one', 2011, 2011, '{"type":"text","text":"How do I fix this?"}'),
 			('part_assistant', 'msg_assistant', 'ses_one', 2021, 2021, '{"type":"text","text":"Use SQLite fallback."}'),
+			('part_assistant_tool', 'msg_assistant', 'ses_one', 2022, 2022, '{"type":"tool-result","tool":"shell","output":"ok"}'),
 			('part_user_2', 'msg_user_2', 'ses_two', 3011, 3011, '{"type":"text","text":"Another session"}');
 	`); err != nil {
 		t.Fatalf("failed to insert parts: %v", err)
@@ -169,9 +170,24 @@ func TestOpencodeAdapterSQLiteSessions(t *testing.T) {
 	if messages[0].Role != "user" || messages[0].Content != "How do I fix this?" {
 		t.Fatalf("unexpected first message: role=%q content=%q", messages[0].Role, messages[0].Content)
 	}
+	if messages[0].HasNonTextParts {
+		t.Fatalf("expected user message to have no non-text parts")
+	}
+	if messages[0].PartTypes["text"] != 1 {
+		t.Fatalf("expected user text part count 1, got %#v", messages[0].PartTypes)
+	}
 
 	if messages[1].Role != "assistant" || messages[1].Content != "Use SQLite fallback." {
 		t.Fatalf("unexpected assistant message: role=%q content=%q", messages[1].Role, messages[1].Content)
+	}
+	if !messages[1].HasNonTextParts {
+		t.Fatalf("expected assistant message to include non-text parts")
+	}
+	if messages[1].PartTypes["text"] != 1 || messages[1].PartTypes["tool-result"] != 1 {
+		t.Fatalf("unexpected part type counts: %#v", messages[1].PartTypes)
+	}
+	if len(messages[1].NonTextParts) != 1 {
+		t.Fatalf("expected one non-text part, got %d", len(messages[1].NonTextParts))
 	}
 
 	if messages[1].Metadata["model"] != "gpt-5.3-codex" {
