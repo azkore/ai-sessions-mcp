@@ -1,23 +1,30 @@
 package adapters
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // OpencodeAdapter implements SessionAdapter for opencode CLI sessions.
-// opencode stores sessions in ~/.local/share/opencode/storage/
+// opencode stores sessions in ~/.local/share/opencode/opencode.db (SQLite).
+// Legacy flat-file storage remains available as a fallback:
+// ~/.local/share/opencode/storage/
 // Structure:
 // - project/[PROJECT_ID].json - project metadata (worktree path, vcs)
 // - session/[PROJECT_ID]/ses_*.json - session metadata (title, timestamps)
 // - message/ses_*/msg_*.json - individual messages in each session
 type OpencodeAdapter struct {
-	homeDir string
+	storageDir string
+	dbPath     string
 }
 
 // NewOpencodeAdapter creates a new opencode session adapter.
@@ -26,12 +33,35 @@ func NewOpencodeAdapter() (*OpencodeAdapter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
 	}
-	return &OpencodeAdapter{homeDir: homeDir}, nil
+
+	baseDir := filepath.Join(homeDir, ".local", "share", "opencode")
+	return &OpencodeAdapter{
+		storageDir: filepath.Join(baseDir, "storage"),
+		dbPath:     filepath.Join(baseDir, "opencode.db"),
+	}, nil
 }
 
 // Name returns the adapter name.
 func (o *OpencodeAdapter) Name() string {
 	return "opencode"
+}
+
+func (o *OpencodeAdapter) openDB() (*sql.DB, error) {
+	if _, err := os.Stat(o.dbPath); err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite", o.dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open opencode database: %w", err)
+	}
+
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set sqlite busy_timeout: %w", err)
+	}
+
+	return db, nil
 }
 
 // opencodeProject represents a project file in storage/project/
@@ -74,7 +104,147 @@ type opencodeMessage struct {
 // ListSessions returns all opencode sessions for the given project.
 // If projectPath is empty, returns sessions from ALL projects.
 func (o *OpencodeAdapter) ListSessions(projectPath string, limit int) ([]Session, error) {
-	storageDir := filepath.Join(o.homeDir, ".local", "share", "opencode", "storage")
+	sessions, err := o.listSessionsFromSQLite(projectPath, limit)
+	if err == nil {
+		return sessions, nil
+	}
+
+	fallbackSessions, fallbackErr := o.listSessionsFromFiles(projectPath, limit)
+	if fallbackErr == nil {
+		return fallbackSessions, nil
+	}
+
+	return nil, fmt.Errorf("failed to list opencode sessions via sqlite (%v) and file fallback (%w)", err, fallbackErr)
+}
+
+// listSessionsFromSQLite lists sessions from opencode.db.
+func (o *OpencodeAdapter) listSessionsFromSQLite(projectPath string, limit int) ([]Session, error) {
+	db, err := o.openDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	return o.listSessionsFromSQLiteWithDB(db, projectPath, limit)
+}
+
+func (o *OpencodeAdapter) listSessionsFromSQLiteWithDB(db *sql.DB, projectPath string, limit int) ([]Session, error) {
+	var absPath string
+	if projectPath != "" {
+		resolvedPath, err := filepath.Abs(projectPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get absolute path: %w", err)
+		}
+		absPath = resolvedPath
+	}
+
+	query := `
+		SELECT s.id, s.title, s.time_created, p.worktree
+		FROM session s
+		JOIN project p ON p.id = s.project_id
+	`
+	args := make([]interface{}, 0, 2)
+
+	if absPath != "" {
+		query += " WHERE p.worktree = ?"
+		args = append(args, absPath)
+	}
+
+	query += " ORDER BY s.time_created DESC"
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query sessions from sqlite: %w", err)
+	}
+	defer rows.Close()
+
+	sessions := make([]Session, 0)
+	for rows.Next() {
+		var (
+			sessionID string
+			title     string
+			createdAt int64
+			worktree  string
+		)
+
+		if err := rows.Scan(&sessionID, &title, &createdAt, &worktree); err != nil {
+			return nil, fmt.Errorf("failed to scan sqlite session row: %w", err)
+		}
+
+		firstMessage, userCount, firstErr := o.getFirstUserMessageAndCountFromSQLite(db, sessionID)
+		if firstErr != nil {
+			firstMessage = ""
+			userCount = 0
+		}
+
+		sessions = append(sessions, Session{
+			ID:               sessionID,
+			Source:           "opencode",
+			ProjectPath:      worktree,
+			FirstMessage:     firstMessage,
+			Summary:          title,
+			Timestamp:        time.UnixMilli(createdAt),
+			FilePath:         o.dbPath,
+			UserMessageCount: userCount,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed while iterating sqlite sessions: %w", err)
+	}
+
+	return sessions, nil
+}
+
+func (o *OpencodeAdapter) getFirstUserMessageAndCountFromSQLite(db *sql.DB, sessionID string) (string, int, error) {
+	firstQuery := `
+		SELECT json_extract(p.data, '$.text')
+		FROM message m
+		JOIN part p ON p.message_id = m.id
+		WHERE m.session_id = ?
+		  AND json_extract(m.data, '$.role') = 'user'
+		  AND json_extract(p.data, '$.type') = 'text'
+		ORDER BY m.time_created ASC, p.time_created ASC
+		LIMIT 1
+	`
+
+	var firstText sql.NullString
+	err := db.QueryRow(firstQuery, sessionID).Scan(&firstText)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", 0, fmt.Errorf("failed to query first user message: %w", err)
+	}
+
+	countQuery := `
+		SELECT COUNT(DISTINCT m.id)
+		FROM message m
+		JOIN part p ON p.message_id = m.id
+		WHERE m.session_id = ?
+		  AND json_extract(m.data, '$.role') = 'user'
+		  AND json_extract(p.data, '$.type') = 'text'
+		  AND trim(COALESCE(json_extract(p.data, '$.text'), '')) <> ''
+	`
+
+	var userCount int
+	if err := db.QueryRow(countQuery, sessionID).Scan(&userCount); err != nil {
+		return "", 0, fmt.Errorf("failed to count user messages: %w", err)
+	}
+
+	firstMessage := ""
+	if firstText.Valid {
+		firstMessage = o.extractFirstLine(firstText.String)
+	}
+
+	return firstMessage, userCount, nil
+}
+
+// listSessionsFromFiles lists sessions from legacy flat-file storage.
+func (o *OpencodeAdapter) listSessionsFromFiles(projectPath string, limit int) ([]Session, error) {
+	storageDir := o.storageDir
 
 	// Check if storage directory exists
 	if _, err := os.Stat(storageDir); os.IsNotExist(err) {
@@ -311,7 +481,188 @@ func (o *OpencodeAdapter) extractFirstLine(text string) string {
 
 // GetSession retrieves the full content of an opencode session with pagination
 func (o *OpencodeAdapter) GetSession(sessionID string, page, pageSize int) ([]Message, error) {
-	storageDir := filepath.Join(o.homeDir, ".local", "share", "opencode", "storage")
+	messages, err := o.getSessionFromSQLite(sessionID, page, pageSize)
+	if err == nil {
+		return messages, nil
+	}
+
+	fallbackMessages, fallbackErr := o.getSessionFromFiles(sessionID, page, pageSize)
+	if fallbackErr == nil {
+		return fallbackMessages, nil
+	}
+
+	return nil, fmt.Errorf("failed to get opencode session via sqlite (%v) and file fallback (%w)", err, fallbackErr)
+}
+
+func (o *OpencodeAdapter) getSessionFromSQLite(sessionID string, page, pageSize int) ([]Message, error) {
+	db, err := o.openDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	messages, err := o.readAllMessagesFromSQLite(db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(messages) == 0 {
+		exists, err := o.sqliteSessionExists(db, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("session not found: %s", sessionID)
+		}
+	}
+
+	start := page * pageSize
+	if start >= len(messages) {
+		return []Message{}, nil
+	}
+
+	end := start + pageSize
+	if end > len(messages) {
+		end = len(messages)
+	}
+
+	return messages[start:end], nil
+}
+
+func (o *OpencodeAdapter) sqliteSessionExists(db *sql.DB, sessionID string) (bool, error) {
+	var exists int
+	err := db.QueryRow("SELECT 1 FROM session WHERE id = ? LIMIT 1", sessionID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check sqlite session existence: %w", err)
+	}
+	return true, nil
+}
+
+func (o *OpencodeAdapter) readAllMessagesFromSQLite(db *sql.DB, sessionID string) ([]Message, error) {
+	rows, err := db.Query(`
+		SELECT id, time_created, data
+		FROM message
+		WHERE session_id = ?
+		ORDER BY time_created ASC
+	`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query sqlite messages: %w", err)
+	}
+	defer rows.Close()
+
+	messages := make([]Message, 0)
+	for rows.Next() {
+		var (
+			messageID  string
+			createdAt  int64
+			messageRaw string
+		)
+
+		if err := rows.Scan(&messageID, &createdAt, &messageRaw); err != nil {
+			return nil, fmt.Errorf("failed to scan sqlite message row: %w", err)
+		}
+
+		var msg opencodeMessage
+		if err := json.Unmarshal([]byte(messageRaw), &msg); err != nil {
+			return nil, fmt.Errorf("failed to parse sqlite message JSON: %w", err)
+		}
+
+		content, err := o.getMessageTextFromSQLite(db, messageID)
+		if err != nil {
+			return nil, err
+		}
+
+		message := Message{
+			Role:     msg.Role,
+			Content:  content,
+			Metadata: make(map[string]interface{}),
+		}
+
+		message.Timestamp = time.UnixMilli(createdAt)
+		if msg.Time != nil {
+			if created := o.extractMessageCreatedAt(msg.Time); created > 0 {
+				message.Timestamp = time.UnixMilli(created)
+			}
+		}
+
+		if msg.ModelID != "" {
+			message.Metadata["model"] = msg.ModelID
+		}
+		if msg.Mode != "" {
+			message.Metadata["mode"] = msg.Mode
+		}
+		if msg.Cost > 0 {
+			message.Metadata["cost"] = msg.Cost
+		}
+		if msg.Tokens != nil {
+			message.Metadata["tokens"] = msg.Tokens
+		}
+
+		messages = append(messages, message)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed while iterating sqlite messages: %w", err)
+	}
+
+	return messages, nil
+}
+
+func (o *OpencodeAdapter) getMessageTextFromSQLite(db *sql.DB, messageID string) (string, error) {
+	rows, err := db.Query(`
+		SELECT COALESCE(json_extract(data, '$.text'), '')
+		FROM part
+		WHERE message_id = ?
+		  AND json_extract(data, '$.type') = 'text'
+		ORDER BY time_created ASC
+	`, messageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to query sqlite parts: %w", err)
+	}
+	defer rows.Close()
+
+	parts := make([]string, 0)
+	for rows.Next() {
+		var text sql.NullString
+		if err := rows.Scan(&text); err != nil {
+			return "", fmt.Errorf("failed to scan sqlite part text: %w", err)
+		}
+		if text.Valid && strings.TrimSpace(text.String) != "" {
+			parts = append(parts, text.String)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("failed while iterating sqlite parts: %w", err)
+	}
+
+	return strings.Join(parts, "\n"), nil
+}
+
+func (o *OpencodeAdapter) extractMessageCreatedAt(raw map[string]interface{}) int64 {
+	created, ok := raw["created"]
+	if !ok {
+		return 0
+	}
+
+	switch v := created.(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
+// getSessionFromFiles retrieves the full content of an opencode session from legacy flat files.
+func (o *OpencodeAdapter) getSessionFromFiles(sessionID string, page, pageSize int) ([]Message, error) {
+	storageDir := o.storageDir
 	messageDir := filepath.Join(storageDir, "message", sessionID)
 
 	// Check if message directory exists
@@ -396,8 +747,63 @@ func (o *OpencodeAdapter) readAllMessages(messageDir string) ([]Message, error) 
 
 // SearchSessions searches opencode sessions for the given query
 func (o *OpencodeAdapter) SearchSessions(projectPath, query string, limit int) ([]Session, error) {
+	matches, err := o.searchSessionsFromSQLite(projectPath, query, limit)
+	if err == nil {
+		return matches, nil
+	}
+
+	fallbackMatches, fallbackErr := o.searchSessionsFromFiles(projectPath, query, limit)
+	if fallbackErr == nil {
+		return fallbackMatches, nil
+	}
+
+	return nil, fmt.Errorf("failed to search opencode sessions via sqlite (%v) and file fallback (%w)", err, fallbackErr)
+}
+
+func (o *OpencodeAdapter) searchSessionsFromSQLite(projectPath, query string, limit int) ([]Session, error) {
+	db, err := o.openDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	sessions, err := o.listSessionsFromSQLiteWithDB(db, projectPath, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	query = strings.ToLower(query)
+	matches := make([]Session, 0)
+
+	for _, session := range sessions {
+		if strings.Contains(strings.ToLower(session.Summary), query) ||
+			strings.Contains(strings.ToLower(session.FirstMessage), query) {
+			matches = append(matches, session)
+		} else {
+			messages, err := o.readAllMessagesFromSQLite(db, session.ID)
+			if err != nil {
+				continue
+			}
+
+			for _, msg := range messages {
+				if strings.Contains(strings.ToLower(msg.Content), query) {
+					matches = append(matches, session)
+					break
+				}
+			}
+		}
+
+		if limit > 0 && len(matches) >= limit {
+			break
+		}
+	}
+
+	return matches, nil
+}
+
+func (o *OpencodeAdapter) searchSessionsFromFiles(projectPath, query string, limit int) ([]Session, error) {
 	// First, list all sessions
-	sessions, err := o.ListSessions(projectPath, 0)
+	sessions, err := o.listSessionsFromFiles(projectPath, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +821,7 @@ func (o *OpencodeAdapter) SearchSessions(projectPath, query string, limit int) (
 		}
 
 		// Search through full session content
-		storageDir := filepath.Join(o.homeDir, ".local", "share", "opencode", "storage")
+		storageDir := o.storageDir
 		messageDir := filepath.Join(storageDir, "message", session.ID)
 		messages, err := o.readAllMessages(messageDir)
 		if err != nil {
