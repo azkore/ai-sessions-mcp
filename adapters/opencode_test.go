@@ -178,6 +178,40 @@ func TestOpencodeAdapterSQLiteSessions(t *testing.T) {
 		t.Fatalf("expected assistant model metadata, got %#v", messages[1].Metadata["model"])
 	}
 
+	pageOne, totalMessages, resolvedPage, hasMore, err := adapter.GetSessionPage("ses_one", 0, 1, false)
+	if err != nil {
+		t.Fatalf("GetSessionPage (forward page 0) returned error: %v", err)
+	}
+	if totalMessages != 2 {
+		t.Fatalf("expected total messages 2, got %d", totalMessages)
+	}
+	if resolvedPage != 0 {
+		t.Fatalf("expected resolved page 0, got %d", resolvedPage)
+	}
+	if !hasMore {
+		t.Fatalf("expected hasMore=true for first page")
+	}
+	if len(pageOne) != 1 || pageOne[0].Role != "user" {
+		t.Fatalf("expected first paged message to be user, got %#v", pageOne)
+	}
+
+	pageFromEnd, totalFromEnd, resolvedFromEnd, hasMoreFromEnd, err := adapter.GetSessionPage("ses_one", 0, 1, true)
+	if err != nil {
+		t.Fatalf("GetSessionPage (from_end) returned error: %v", err)
+	}
+	if totalFromEnd != 2 {
+		t.Fatalf("expected total messages 2 from end, got %d", totalFromEnd)
+	}
+	if resolvedFromEnd != 1 {
+		t.Fatalf("expected resolved page 1 from end, got %d", resolvedFromEnd)
+	}
+	if hasMoreFromEnd {
+		t.Fatalf("expected hasMore=false on last page")
+	}
+	if len(pageFromEnd) != 1 || pageFromEnd[0].Role != "assistant" {
+		t.Fatalf("expected last paged message to be assistant, got %#v", pageFromEnd)
+	}
+
 	results, err := adapter.SearchSessions(projectOne, "sqlite fallback", 10)
 	if err != nil {
 		t.Fatalf("SearchSessions returned error: %v", err)

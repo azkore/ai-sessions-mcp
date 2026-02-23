@@ -479,100 +479,117 @@ func (o *OpencodeAdapter) extractFirstLine(text string) string {
 	return ""
 }
 
-// GetSession retrieves the full content of an opencode session with pagination
+// GetSession retrieves the full content of an opencode session with pagination.
 func (o *OpencodeAdapter) GetSession(sessionID string, page, pageSize int) ([]Message, error) {
-	messages, err := o.getSessionFromSQLite(sessionID, page, pageSize)
-	if err == nil {
-		return messages, nil
-	}
-
-	fallbackMessages, fallbackErr := o.getSessionFromFiles(sessionID, page, pageSize)
-	if fallbackErr == nil {
-		return fallbackMessages, nil
-	}
-
-	return nil, fmt.Errorf("failed to get opencode session via sqlite (%v) and file fallback (%w)", err, fallbackErr)
-}
-
-func (o *OpencodeAdapter) getSessionFromSQLite(sessionID string, page, pageSize int) ([]Message, error) {
-	db, err := o.openDB()
+	messages, _, _, _, err := o.GetSessionPage(sessionID, page, pageSize, false)
 	if err != nil {
 		return nil, err
+	}
+	return messages, nil
+}
+
+// GetSessionPage retrieves one page of session messages plus pagination metadata.
+// If fromEnd is true, page=0 means last page, page=1 means second-to-last, etc.
+func (o *OpencodeAdapter) GetSessionPage(sessionID string, page, pageSize int, fromEnd bool) ([]Message, int, int, bool, error) {
+	if page < 0 {
+		page = 0
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+
+	messages, totalMessages, resolvedPage, hasMore, err := o.getSessionPageFromSQLite(sessionID, page, pageSize, fromEnd)
+	if err == nil {
+		return messages, totalMessages, resolvedPage, hasMore, nil
+	}
+
+	fallbackMessages, fallbackTotal, fallbackResolved, fallbackHasMore, fallbackErr := o.getSessionPageFromFiles(sessionID, page, pageSize, fromEnd)
+	if fallbackErr == nil {
+		return fallbackMessages, fallbackTotal, fallbackResolved, fallbackHasMore, nil
+	}
+
+	return nil, 0, page, false, fmt.Errorf("failed to get opencode session via sqlite (%v) and file fallback (%w)", err, fallbackErr)
+}
+
+func (o *OpencodeAdapter) getSessionPageFromSQLite(sessionID string, page, pageSize int, fromEnd bool) ([]Message, int, int, bool, error) {
+	db, err := o.openDB()
+	if err != nil {
+		return nil, 0, page, false, err
 	}
 	defer db.Close()
 
-	messages, err := o.readAllMessagesFromSQLite(db, sessionID)
+	exists, err := o.sqliteSessionExists(db, sessionID)
 	if err != nil {
-		return nil, err
+		return nil, 0, page, false, err
+	}
+	if !exists {
+		return nil, 0, page, false, fmt.Errorf("session not found: %s", sessionID)
 	}
 
-	if len(messages) == 0 {
-		exists, err := o.sqliteSessionExists(db, sessionID)
-		if err != nil {
-			return nil, err
-		}
-		if !exists {
-			return nil, fmt.Errorf("session not found: %s", sessionID)
-		}
-	}
-
-	start := page * pageSize
-	if start >= len(messages) {
-		return []Message{}, nil
-	}
-
-	end := start + pageSize
-	if end > len(messages) {
-		end = len(messages)
-	}
-
-	return messages[start:end], nil
-}
-
-func (o *OpencodeAdapter) sqliteSessionExists(db *sql.DB, sessionID string) (bool, error) {
-	var exists int
-	err := db.QueryRow("SELECT 1 FROM session WHERE id = ? LIMIT 1", sessionID).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	totalMessages, err := o.countSessionMessagesFromSQLite(db, sessionID)
 	if err != nil {
-		return false, fmt.Errorf("failed to check sqlite session existence: %w", err)
+		return nil, 0, page, false, err
 	}
-	return true, nil
-}
 
-func (o *OpencodeAdapter) readAllMessagesFromSQLite(db *sql.DB, sessionID string) ([]Message, error) {
+	resolvedPage := resolvePage(page, pageSize, totalMessages, fromEnd)
+	if resolvedPage < 0 {
+		return []Message{}, totalMessages, resolvedPage, false, nil
+	}
+
+	offset := resolvedPage * pageSize
+	if offset >= totalMessages {
+		return []Message{}, totalMessages, resolvedPage, false, nil
+	}
+
 	rows, err := db.Query(`
 		SELECT id, time_created, data
 		FROM message
 		WHERE session_id = ?
-		ORDER BY time_created ASC
-	`, sessionID)
+		ORDER BY time_created ASC, id ASC
+		LIMIT ? OFFSET ?
+	`, sessionID, pageSize, offset)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query sqlite messages: %w", err)
+		return nil, 0, page, false, fmt.Errorf("failed to query sqlite message page: %w", err)
 	}
 	defer rows.Close()
 
-	messages := make([]Message, 0)
+	type messageRow struct {
+		id        string
+		createdAt int64
+		raw       string
+	}
+
+	messageRows := make([]messageRow, 0, pageSize)
+	messageIDs := make([]string, 0, pageSize)
+
 	for rows.Next() {
-		var (
-			messageID  string
-			createdAt  int64
-			messageRaw string
-		)
-
-		if err := rows.Scan(&messageID, &createdAt, &messageRaw); err != nil {
-			return nil, fmt.Errorf("failed to scan sqlite message row: %w", err)
+		var row messageRow
+		if err := rows.Scan(&row.id, &row.createdAt, &row.raw); err != nil {
+			return nil, 0, page, false, fmt.Errorf("failed to scan sqlite message row: %w", err)
 		}
+		messageRows = append(messageRows, row)
+		messageIDs = append(messageIDs, row.id)
+	}
 
+	if err := rows.Err(); err != nil {
+		return nil, 0, page, false, fmt.Errorf("failed while iterating sqlite message page: %w", err)
+	}
+
+	textPartsByMessageID, err := o.getMessageTextPartsByMessageID(db, messageIDs)
+	if err != nil {
+		return nil, 0, page, false, err
+	}
+
+	messages := make([]Message, 0, len(messageRows))
+	for _, row := range messageRows {
 		var msg opencodeMessage
-		if err := json.Unmarshal([]byte(messageRaw), &msg); err != nil {
-			return nil, fmt.Errorf("failed to parse sqlite message JSON: %w", err)
+		if err := json.Unmarshal([]byte(row.raw), &msg); err != nil {
+			return nil, 0, page, false, fmt.Errorf("failed to parse sqlite message JSON: %w", err)
 		}
 
-		content, err := o.getMessageTextFromSQLite(db, messageID)
-		if err != nil {
-			return nil, err
+		content := strings.Join(textPartsByMessageID[row.id], "\n")
+		if content == "" {
+			content = o.extractMessageContent(msg.Content)
 		}
 
 		message := Message{
@@ -581,7 +598,7 @@ func (o *OpencodeAdapter) readAllMessagesFromSQLite(db *sql.DB, sessionID string
 			Metadata: make(map[string]interface{}),
 		}
 
-		message.Timestamp = time.UnixMilli(createdAt)
+		message.Timestamp = time.UnixMilli(row.createdAt)
 		if msg.Time != nil {
 			if created := o.extractMessageCreatedAt(msg.Time); created > 0 {
 				message.Timestamp = time.UnixMilli(created)
@@ -604,42 +621,109 @@ func (o *OpencodeAdapter) readAllMessagesFromSQLite(db *sql.DB, sessionID string
 		messages = append(messages, message)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed while iterating sqlite messages: %w", err)
-	}
-
-	return messages, nil
+	hasMore := offset+len(messages) < totalMessages
+	return messages, totalMessages, resolvedPage, hasMore, nil
 }
 
-func (o *OpencodeAdapter) getMessageTextFromSQLite(db *sql.DB, messageID string) (string, error) {
-	rows, err := db.Query(`
-		SELECT COALESCE(json_extract(data, '$.text'), '')
-		FROM part
-		WHERE message_id = ?
-		  AND json_extract(data, '$.type') = 'text'
-		ORDER BY time_created ASC
-	`, messageID)
+func (o *OpencodeAdapter) sqliteSessionExists(db *sql.DB, sessionID string) (bool, error) {
+	var exists int
+	err := db.QueryRow("SELECT 1 FROM session WHERE id = ? LIMIT 1", sessionID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		return "", fmt.Errorf("failed to query sqlite parts: %w", err)
+		return false, fmt.Errorf("failed to check sqlite session existence: %w", err)
 	}
-	defer rows.Close()
+	return true, nil
+}
 
-	parts := make([]string, 0)
-	for rows.Next() {
-		var text sql.NullString
-		if err := rows.Scan(&text); err != nil {
-			return "", fmt.Errorf("failed to scan sqlite part text: %w", err)
+func (o *OpencodeAdapter) countSessionMessagesFromSQLite(db *sql.DB, sessionID string) (int, error) {
+	var total int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM message
+		WHERE session_id = ?
+	`, sessionID).Scan(&total); err != nil {
+		return 0, fmt.Errorf("failed to count sqlite session messages: %w", err)
+	}
+	return total, nil
+}
+
+func (o *OpencodeAdapter) getMessageTextPartsByMessageID(db *sql.DB, messageIDs []string) (map[string][]string, error) {
+	result := make(map[string][]string, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return result, nil
+	}
+
+	const chunkSize = 400
+	for start := 0; start < len(messageIDs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(messageIDs) {
+			end = len(messageIDs)
 		}
-		if text.Valid && strings.TrimSpace(text.String) != "" {
-			parts = append(parts, text.String)
+
+		chunk := messageIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = strings.TrimSuffix(placeholders, ",")
+
+		query := fmt.Sprintf(`
+			SELECT message_id, COALESCE(json_extract(data, '$.text'), '')
+			FROM part
+			WHERE message_id IN (%s)
+			  AND json_extract(data, '$.type') = 'text'
+			ORDER BY message_id ASC, time_created ASC
+		`, placeholders)
+
+		args := make([]interface{}, 0, len(chunk))
+		for _, id := range chunk {
+			args = append(args, id)
 		}
+
+		rows, err := db.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query sqlite parts for message chunk: %w", err)
+		}
+
+		for rows.Next() {
+			var messageID string
+			var text sql.NullString
+			if err := rows.Scan(&messageID, &text); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to scan sqlite part text: %w", err)
+			}
+
+			if text.Valid && strings.TrimSpace(text.String) != "" {
+				result[messageID] = append(result[messageID], text.String)
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed while iterating sqlite parts: %w", err)
+		}
+
+		rows.Close()
 	}
 
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("failed while iterating sqlite parts: %w", err)
+	return result, nil
+}
+
+func resolvePage(page, pageSize, totalMessages int, fromEnd bool) int {
+	if !fromEnd {
+		return page
 	}
 
-	return strings.Join(parts, "\n"), nil
+	if totalMessages == 0 {
+		return 0
+	}
+
+	lastPage := (totalMessages - 1) / pageSize
+	resolvedPage := lastPage - page
+	if resolvedPage < 0 {
+		return -1
+	}
+
+	return resolvedPage
 }
 
 func (o *OpencodeAdapter) extractMessageCreatedAt(raw map[string]interface{}) int64 {
@@ -660,26 +744,32 @@ func (o *OpencodeAdapter) extractMessageCreatedAt(raw map[string]interface{}) in
 	}
 }
 
-// getSessionFromFiles retrieves the full content of an opencode session from legacy flat files.
-func (o *OpencodeAdapter) getSessionFromFiles(sessionID string, page, pageSize int) ([]Message, error) {
+// getSessionPageFromFiles retrieves one page of an opencode session from legacy flat files.
+func (o *OpencodeAdapter) getSessionPageFromFiles(sessionID string, page, pageSize int, fromEnd bool) ([]Message, int, int, bool, error) {
 	storageDir := o.storageDir
 	messageDir := filepath.Join(storageDir, "message", sessionID)
 
 	// Check if message directory exists
 	if _, err := os.Stat(messageDir); os.IsNotExist(err) {
-		return nil, fmt.Errorf("session not found: %s", sessionID)
+		return nil, 0, page, false, fmt.Errorf("session not found: %s", sessionID)
 	}
 
 	// Read all messages
 	messages, err := o.readAllMessages(messageDir)
 	if err != nil {
-		return nil, err
+		return nil, 0, page, false, err
+	}
+	totalMessages := len(messages)
+
+	resolvedPage := resolvePage(page, pageSize, totalMessages, fromEnd)
+	if resolvedPage < 0 {
+		return []Message{}, totalMessages, resolvedPage, false, nil
 	}
 
 	// Apply pagination
-	start := page * pageSize
+	start := resolvedPage * pageSize
 	if start >= len(messages) {
-		return []Message{}, nil
+		return []Message{}, totalMessages, resolvedPage, false, nil
 	}
 
 	end := start + pageSize
@@ -687,7 +777,9 @@ func (o *OpencodeAdapter) getSessionFromFiles(sessionID string, page, pageSize i
 		end = len(messages)
 	}
 
-	return messages[start:end], nil
+	hasMore := end < totalMessages
+
+	return messages[start:end], totalMessages, resolvedPage, hasMore, nil
 }
 
 // readAllMessages reads all messages from a session directory
@@ -767,35 +859,84 @@ func (o *OpencodeAdapter) searchSessionsFromSQLite(projectPath, query string, li
 	}
 	defer db.Close()
 
-	sessions, err := o.listSessionsFromSQLiteWithDB(db, projectPath, 0)
-	if err != nil {
-		return nil, err
+	var absPath string
+	if projectPath != "" {
+		resolvedPath, err := filepath.Abs(projectPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get absolute path: %w", err)
+		}
+		absPath = resolvedPath
 	}
 
-	query = strings.ToLower(query)
+	lowerLikeQuery := "%" + strings.ToLower(query) + "%"
+	sqlQuery := `
+		SELECT DISTINCT s.id, s.title, s.time_created, p.worktree
+		FROM session s
+		JOIN project p ON p.id = s.project_id
+		WHERE (
+			LOWER(s.title) LIKE ?
+			OR EXISTS (
+				SELECT 1
+				FROM message m
+				JOIN part pt ON pt.message_id = m.id
+				WHERE m.session_id = s.id
+				  AND json_extract(pt.data, '$.type') = 'text'
+				  AND LOWER(COALESCE(json_extract(pt.data, '$.text'), '')) LIKE ?
+			)
+		)
+	`
+
+	args := []interface{}{lowerLikeQuery, lowerLikeQuery}
+	if absPath != "" {
+		sqlQuery += " AND p.worktree = ?"
+		args = append(args, absPath)
+	}
+
+	sqlQuery += " ORDER BY s.time_created DESC"
+	if limit > 0 {
+		sqlQuery += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := db.Query(sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search sqlite sessions: %w", err)
+	}
+	defer rows.Close()
+
 	matches := make([]Session, 0)
+	for rows.Next() {
+		var (
+			sessionID string
+			title     string
+			createdAt int64
+			worktree  string
+		)
 
-	for _, session := range sessions {
-		if strings.Contains(strings.ToLower(session.Summary), query) ||
-			strings.Contains(strings.ToLower(session.FirstMessage), query) {
-			matches = append(matches, session)
-		} else {
-			messages, err := o.readAllMessagesFromSQLite(db, session.ID)
-			if err != nil {
-				continue
-			}
-
-			for _, msg := range messages {
-				if strings.Contains(strings.ToLower(msg.Content), query) {
-					matches = append(matches, session)
-					break
-				}
-			}
+		if err := rows.Scan(&sessionID, &title, &createdAt, &worktree); err != nil {
+			return nil, fmt.Errorf("failed to scan sqlite search result: %w", err)
 		}
 
-		if limit > 0 && len(matches) >= limit {
-			break
+		firstMessage, userCount, firstErr := o.getFirstUserMessageAndCountFromSQLite(db, sessionID)
+		if firstErr != nil {
+			firstMessage = ""
+			userCount = 0
 		}
+
+		matches = append(matches, Session{
+			ID:               sessionID,
+			Source:           "opencode",
+			ProjectPath:      worktree,
+			FirstMessage:     firstMessage,
+			Summary:          title,
+			Timestamp:        time.UnixMilli(createdAt),
+			FilePath:         o.dbPath,
+			UserMessageCount: userCount,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed while iterating sqlite search results: %w", err)
 	}
 
 	return matches, nil

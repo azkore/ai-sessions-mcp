@@ -20,6 +20,10 @@ import (
 	"github.com/yoavf/ai-sessions-mcp/search"
 )
 
+type paginationCapableAdapter interface {
+	GetSessionPage(sessionID string, page, pageSize int, fromEnd bool) ([]adapters.Message, int, int, bool, error)
+}
+
 func main() {
 	// Check if running in CLI mode (has command arguments)
 	if len(os.Args) > 1 {
@@ -319,6 +323,7 @@ type getSessionArgs struct {
 	Source    string `json:"source" jsonschema:"The source that created this session (claude, gemini, codex, opencode, mistral, copilot)"`
 	Page      int    `json:"page,omitempty" jsonschema:"Page number for pagination (0-indexed)"`
 	PageSize  int    `json:"page_size,omitempty" jsonschema:"Number of messages per page"`
+	FromEnd   bool   `json:"from_end,omitempty" jsonschema:"If true, page 0 means the last page, page 1 means the second-to-last page (currently supported by opencode)."`
 }
 
 func addGetSessionTool(server *mcp.Server, adaptersMap map[string]adapters.SessionAdapter) {
@@ -341,19 +346,60 @@ func addGetSessionTool(server *mcp.Server, adaptersMap map[string]adapters.Sessi
 		if args.PageSize == 0 {
 			args.PageSize = 20
 		}
+		if args.Page < 0 {
+			args.Page = 0
+		}
 
-		messages, err := adapter.GetSession(args.SessionID, args.Page, args.PageSize)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get session: %w", err)
+		var (
+			messages      []adapters.Message
+			totalMessages int
+			resolvedPage  = args.Page
+			hasMore       bool
+			err           error
+		)
+
+		if paginator, ok := adapter.(paginationCapableAdapter); ok {
+			messages, totalMessages, resolvedPage, hasMore, err = paginator.GetSessionPage(args.SessionID, args.Page, args.PageSize, args.FromEnd)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get session: %w", err)
+			}
+		} else {
+			if args.FromEnd {
+				return nil, nil, fmt.Errorf("from_end is not supported for source: %s", args.Source)
+			}
+
+			fetched, err := adapter.GetSession(args.SessionID, args.Page, args.PageSize+1)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get session: %w", err)
+			}
+
+			hasMore = len(fetched) > args.PageSize
+			messages = fetched
+			if hasMore {
+				messages = fetched[:args.PageSize]
+			}
+		}
+
+		totalPages := 0
+		if totalMessages > 0 {
+			totalPages = (totalMessages + args.PageSize - 1) / args.PageSize
 		}
 
 		result := map[string]interface{}{
-			"session_id": args.SessionID,
-			"source":     args.Source,
-			"page":       args.Page,
-			"page_size":  args.PageSize,
-			"messages":   messages,
-			"count":      len(messages),
+			"session_id":    args.SessionID,
+			"source":        args.Source,
+			"page":          args.Page,
+			"resolved_page": resolvedPage,
+			"page_size":     args.PageSize,
+			"from_end":      args.FromEnd,
+			"has_more":      hasMore,
+			"messages":      messages,
+			"count":         len(messages),
+		}
+
+		if _, ok := adapter.(paginationCapableAdapter); ok {
+			result["total_messages"] = totalMessages
+			result["total_pages"] = totalPages
 		}
 
 		resultJSON, err := json.MarshalIndent(result, "", "  ")
